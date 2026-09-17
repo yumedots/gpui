@@ -16,7 +16,9 @@ use image::RgbaImage;
 use core_foundation::base::TCFType;
 use core_video::{
     metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
-    pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    pixel_buffer::{
+        kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    },
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
@@ -133,6 +135,7 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    surfaces_bgra_pipeline_state: metal::RenderPipelineState,
     backdrops_pipeline_state: metal::RenderPipelineState,
     blur_pipeline_state: metal::RenderPipelineState,
     blit_pipeline_state: metal::RenderPipelineState,
@@ -336,6 +339,14 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let surfaces_bgra_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "surfaces",
+            "surface_vertex",
+            "surface_bgra_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let backdrops_pipeline_state = build_filter_pipeline_state(
             &device,
@@ -404,6 +415,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            surfaces_bgra_pipeline_state,
             backdrops_pipeline_state,
             blur_pipeline_state,
             blit_pipeline_state,
@@ -1624,7 +1636,6 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
         command_encoder.set_vertex_buffer(
             SurfaceInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1642,53 +1653,74 @@ impl MetalRenderer {
         );
 
         for (index, surface) in surfaces.iter().enumerate() {
+            let image_buffer = &surface.image_buffer;
             let texture_size = size(
-                DevicePixels::from(surface.image_buffer.get_width() as i32),
-                DevicePixels::from(surface.image_buffer.get_height() as i32),
+                DevicePixels::from(image_buffer.get_width() as i32),
+                DevicePixels::from(image_buffer.get_height() as i32),
             );
-
-            assert_eq!(
-                surface.image_buffer.get_pixel_format(),
-                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-            );
-
-            let y_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::R8Unorm,
-                    surface.image_buffer.get_width_of_plane(0),
-                    surface.image_buffer.get_height_of_plane(0),
-                    0,
-                )
-                .unwrap();
-            let cb_cr_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::RG8Unorm,
-                    surface.image_buffer.get_width_of_plane(1),
-                    surface.image_buffer.get_height_of_plane(1),
-                    1,
-                )
-                .unwrap();
 
             command_encoder.set_vertex_bytes(
                 SurfaceInputIndex::TextureSize as u64,
                 mem::size_of_val(&texture_size) as u64,
                 &texture_size as *const Size<DevicePixels> as *const _,
             );
-            // let y_texture = y_texture.get_texture().unwrap().
-            command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
-            command_encoder.set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
+
+            if image_buffer.get_pixel_format() == kCVPixelFormatType_32BGRA {
+                command_encoder.set_render_pipeline_state(&self.surfaces_bgra_pipeline_state);
+                let texture = self
+                    .core_video_texture_cache
+                    .create_texture_from_image(
+                        image_buffer.as_concrete_TypeRef(),
+                        None,
+                        MTLPixelFormat::BGRA8Unorm,
+                        image_buffer.get_width(),
+                        image_buffer.get_height(),
+                        0,
+                    )
+                    .unwrap();
+                command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
+                    let texture = CVMetalTextureGetTexture(texture.as_concrete_TypeRef());
+                    Some(metal::TextureRef::from_ptr(texture as *mut _))
+                });
+            } else {
+                assert_eq!(
+                    image_buffer.get_pixel_format(),
+                    kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                );
+
+                command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+                let y_texture = self
+                    .core_video_texture_cache
+                    .create_texture_from_image(
+                        image_buffer.as_concrete_TypeRef(),
+                        None,
+                        MTLPixelFormat::R8Unorm,
+                        image_buffer.get_width_of_plane(0),
+                        image_buffer.get_height_of_plane(0),
+                        0,
+                    )
+                    .unwrap();
+                let cb_cr_texture = self
+                    .core_video_texture_cache
+                    .create_texture_from_image(
+                        image_buffer.as_concrete_TypeRef(),
+                        None,
+                        MTLPixelFormat::RG8Unorm,
+                        image_buffer.get_width_of_plane(1),
+                        image_buffer.get_height_of_plane(1),
+                        1,
+                    )
+                    .unwrap();
+
+                command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
+                    let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
+                    Some(metal::TextureRef::from_ptr(texture as *mut _))
+                });
+                command_encoder.set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, unsafe {
+                    let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
+                    Some(metal::TextureRef::from_ptr(texture as *mut _))
+                });
+            }
 
             command_encoder.draw_primitives_instanced_base_instance(
                 metal::MTLPrimitiveType::Triangle,
