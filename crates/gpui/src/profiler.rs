@@ -766,6 +766,36 @@ pub fn trace_enabled() -> bool {
     TRACE_STATE.load(Ordering::Relaxed) != 0
 }
 
+#[cfg(feature = "profiler")]
+use std::sync::atomic::AtomicBool;
+
+#[cfg(feature = "profiler")]
+static FRAME_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enables or disables frame event collection at runtime, independently of full
+/// trace collection.
+///
+/// When transitioning from enabled to disabled, the buffered frame events are
+/// cleared so stale data isn't reported after a later re-enable. Returns false
+/// if the value was unchanged.
+#[cfg(feature = "profiler")]
+pub fn set_frame_trace_enabled(enabled: bool) -> bool {
+    if FRAME_TRACE_ENABLED.swap(enabled, Ordering::AcqRel) == enabled {
+        return false;
+    }
+
+    if !enabled {
+        clear_frame_timings();
+    }
+    true
+}
+
+/// Returns whether frame event collection is enabled.
+#[cfg(feature = "profiler")]
+pub fn frame_trace_enabled() -> bool {
+    FRAME_TRACE_ENABLED.load(Ordering::Relaxed)
+}
+
 fn clear_trace_buffers() {
     for (_, timings) in upgraded_thread_timings() {
         let mut timings = timings.lock();
@@ -774,12 +804,19 @@ fn clear_trace_buffers() {
         timings.total_pushed = 0;
     }
     #[cfg(feature = "profiler")]
-    {
-        let mut frames = FRAME_TIMINGS.lock();
-        frames.timings.clear();
-        frames.timings.shrink_to_fit();
-        frames.total_pushed = 0;
+    // Frame events are kept when a caller collects frames without full tracing.
+    if !frame_trace_enabled() {
+        clear_frame_timings();
     }
+}
+
+/// Drops buffered frame events so stale data isn't reported later.
+#[cfg(feature = "profiler")]
+fn clear_frame_timings() {
+    let mut frames = FRAME_TIMINGS.lock();
+    frames.timings.clear();
+    frames.timings.shrink_to_fit();
+    frames.total_pushed = 0;
 }
 
 /// Timing for a single drawn window frame.
@@ -1163,10 +1200,11 @@ static FRAME_TIMINGS: spin::Mutex<FrameTimings> = spin::Mutex::new(FrameTimings 
 
 /// Records a frame event.
 ///
-/// No-op unless profiler tracing is enabled via [`set_trace_enabled`].
+/// No-op unless profiler tracing is enabled via [`set_trace_enabled`] or frame
+/// events are enabled via [`set_frame_trace_enabled`].
 #[cfg(feature = "profiler")]
 pub fn record_frame_event(event: FrameEvent) {
-    if !trace_enabled() {
+    if !trace_enabled() && !frame_trace_enabled() {
         return;
     }
     std::hint::cold_path(); // optimize for when profiling is off
@@ -1260,6 +1298,40 @@ mod tests {
         assert_eq!(timing.dirty_at, Some(dirty_at));
         assert_eq!(timing.invalidations, 3);
         assert!(timing.draw_start >= dirty_at);
+    }
+
+    #[test]
+    fn records_draw_events_while_only_frame_tracing_is_enabled() {
+        let _trace_test_guard = TraceTestGuard::new();
+        let window_id = WindowId::from(0xF8A3);
+        let mut window_profiler =
+            WindowProfiler::new(window_id).expect("window profiler should initialize");
+        let mut collector = FrameTimingCollector::new();
+
+        set_frame_trace_enabled(true);
+        window_profiler.begin_draw();
+        window_profiler.end_draw(Some(Instant::now()), 2);
+        assert_eq!(trace_enabled(), false);
+        assert_eq!(
+            collector
+                .collect_unseen()
+                .into_iter()
+                .find_map(|event| match event {
+                    FrameEvent::Draw(timing) if timing.window_id == window_id => Some(timing),
+                    _ => None,
+                })
+                .expect("draw event should be recorded while frame tracing is enabled")
+                .invalidations,
+            2
+        );
+
+        set_frame_trace_enabled(false);
+        assert!(
+            collector
+                .collect_unseen()
+                .iter()
+                .all(|event| !event_matches_window(*event, window_id))
+        );
     }
 
     #[test]
@@ -1481,6 +1553,7 @@ mod tests {
 
     struct TraceTestGuard {
         was_enabled: bool,
+        frame_was_enabled: bool,
         _lock: MutexGuard<'static, ()>,
     }
 
@@ -1491,8 +1564,11 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let was_enabled = trace_enabled();
             set_trace_enabled(false);
+            let frame_was_enabled = frame_trace_enabled();
+            set_frame_trace_enabled(false);
             Self {
                 was_enabled,
+                frame_was_enabled,
                 _lock: lock,
             }
         }
@@ -1501,8 +1577,12 @@ mod tests {
     impl Drop for TraceTestGuard {
         fn drop(&mut self) {
             set_trace_enabled(false);
+            set_frame_trace_enabled(false);
             if self.was_enabled {
                 set_trace_enabled(true);
+            }
+            if self.frame_was_enabled {
+                set_frame_trace_enabled(true);
             }
         }
     }
